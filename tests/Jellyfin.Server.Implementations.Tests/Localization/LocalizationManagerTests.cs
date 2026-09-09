@@ -265,6 +265,25 @@ namespace Jellyfin.Server.Implementations.Tests.Localization
             Assert.Null(localizationManager.GetRatingScore("unrated"));
             Assert.Null(localizationManager.GetRatingScore("Not Rated"));
             Assert.Null(localizationManager.GetRatingScore("n/a"));
+            Assert.Null(localizationManager.GetRatingScore("N/A"));
+            Assert.Null(localizationManager.GetRatingScore(" n/a "));
+        }
+
+        [Theory]
+        // "NR" and "UR" are rating strings of some systems, so they must stay unrated when listed alongside others
+        [InlineData("NR / R", 17, 0)]
+        [InlineData("unrated / R", 17, 0)]
+        [InlineData("R / NR", 17, 0)]
+        public async Task GetRatingLevel_SkipsUnratedListEntries_Success(string value, int? expectedScore, int? expectedSubScore)
+        {
+            var localizationManager = Setup(new ServerConfiguration { MetadataCountryCode = "us" });
+            await localizationManager.LoadAll();
+
+            var score = localizationManager.GetRatingScore(value);
+
+            Assert.NotNull(score);
+            Assert.Equal(expectedScore, score.Score);
+            Assert.Equal(expectedSubScore, score.SubScore);
         }
 
         [Theory]
