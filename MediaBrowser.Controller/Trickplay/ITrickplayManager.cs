@@ -16,6 +16,12 @@ public interface ITrickplayManager
     /// <summary>
     /// Generates new trickplay images and metadata.
     /// </summary>
+    /// <remarks>
+    /// This method is also the cleanup path. When the library has trickplay extraction disabled, it
+    /// does not generate data. Instead it removes the data that an earlier run left behind.
+    /// Trickplay files next to the media are user-managed. The server only catalogs those files. It
+    /// never deletes them.
+    /// </remarks>
     /// <param name="video">The video.</param>
     /// <param name="replace">Whether or not existing data should be replaced.</param>
     /// <param name="libraryOptions">The library options.</param>

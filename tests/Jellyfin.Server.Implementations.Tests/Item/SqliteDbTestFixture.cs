@@ -11,6 +11,7 @@ using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Model.Configuration;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 
@@ -20,6 +21,8 @@ namespace Jellyfin.Server.Implementations.Tests.Item;
 /// Base fixture for the item tests that run against the SQLite provider: one in-memory database per
 /// test class, plus the wiring the repositories under test need. The connection owns the database, so
 /// it stays open for the lifetime of the fixture. Derived classes seed in their own constructor.
+/// A derived class can give an EF Core interceptor to the constructor. Use an interceptor to see the
+/// SQL statements that the code under test sends to the database.
 /// </summary>
 public abstract class SqliteDbTestFixture : IDisposable
 {
@@ -27,15 +30,24 @@ public abstract class SqliteDbTestFixture : IDisposable
     private readonly DbContextOptions<JellyfinDbContext> _dbOptions;
 
     protected SqliteDbTestFixture()
+        : this(null)
+    {
+    }
+
+    protected SqliteDbTestFixture(IInterceptor? interceptor)
     {
         ApplicationPaths = new Mock<IApplicationPaths>().Object;
 
         _connection = new SqliteConnection("Data Source=:memory:");
         _connection.Open();
 
-        _dbOptions = new DbContextOptionsBuilder<JellyfinDbContext>()
-            .UseSqlite(_connection)
-            .Options;
+        var builder = new DbContextOptionsBuilder<JellyfinDbContext>().UseSqlite(_connection);
+        if (interceptor is not null)
+        {
+            builder.AddInterceptors(interceptor);
+        }
+
+        _dbOptions = builder.Options;
 
         using var context = CreateDbContext();
         context.Database.EnsureCreated();

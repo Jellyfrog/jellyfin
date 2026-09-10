@@ -277,22 +277,81 @@ public partial class TrickplayManager : ITrickplayManager
         }
     }
 
-    /// <inheritdoc />
-    public async Task RefreshTrickplayDataAsync(Video video, bool replace, LibraryOptions libraryOptions, CancellationToken cancellationToken)
+    /// <summary>
+    /// Deletes a trickplay directory. Writes a log warning if the delete operation fails.
+    /// </summary>
+    /// <param name="trickplayDirectory">The directory to delete.</param>
+    private void TryDeleteTrickplayDirectory(string trickplayDirectory)
     {
-        var options = _config.Configuration.TrickplayOptions;
-        if (!CanGenerateTrickplay(video, options.Interval) || libraryOptions is null)
+        if (!Directory.Exists(trickplayDirectory))
         {
             return;
         }
 
+        try
+        {
+            Directory.Delete(trickplayDirectory, true);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Unable to clear trickplay directory: {Directory}: {Exception}", trickplayDirectory, ex);
+        }
+    }
+
+    /// <summary>
+    /// Removes the trickplay data that the server made for a video. Call this method when the
+    /// library has trickplay extraction disabled. It only touches the internal trickplay directory.
+    /// Files next to the media are user-managed. <see cref="DiscoverExistingTrickplayAsync"/>
+    /// catalogs those files. The server never deletes them.
+    /// </summary>
+    /// <param name="video">The video.</param>
+    /// <param name="cancellationToken">The cancellation token.</param>
+    /// <returns>Task.</returns>
+    private async Task PruneTrickplayDataAsync(Video video, CancellationToken cancellationToken)
+    {
+        TryDeleteTrickplayDirectory(_pathManager.GetTrickplayDirectory(video, false));
+        await DeleteTrickplayDataAsync(video.Id, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc />
+    public async Task RefreshTrickplayDataAsync(Video video, bool replace, LibraryOptions libraryOptions, CancellationToken cancellationToken)
+    {
+        if (libraryOptions is null)
+        {
+            return;
+        }
+
+        var options = _config.Configuration.TrickplayOptions;
         var saveWithMedia = libraryOptions.SaveTrickplayWithMedia;
 
-        // Catalog any existing trickplay folders on disk before any prune/generate. This picks up
-        // user-placed files even when their (width, tile dims) don't match the server's configured values.
+        // Extraction is off and there is nothing to regenerate. The only work left is to clean up
+        // after an earlier run. This is the only path that does that cleanup. The scheduled task
+        // calls this method for every video in every library. So this path must stay cheap when
+        // trickplay is off. It must not query media streams. It must not delete without a reason.
+        var cleanupOnly = !libraryOptions.EnableTrickplayImageExtraction && !replace;
+        if (cleanupOnly && !saveWithMedia)
+        {
+            await PruneTrickplayDataAsync(video, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        if (!CanGenerateTrickplay(video, options.Interval))
+        {
+            return;
+        }
+
+        // Catalog the trickplay folders that are already on disk. Do this before the server prunes
+        // or generates. This finds files that a user made. Those files can use different values for
+        // width and tile size than the server uses.
         if (!replace)
         {
             await DiscoverExistingTrickplayAsync(video, saveWithMedia, cancellationToken).ConfigureAwait(false);
+        }
+
+        // Files next to the media are user-managed. The server catalogs them but never deletes them.
+        if (cleanupOnly)
+        {
+            return;
         }
 
         var dbContext = await _dbProvider.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
@@ -300,37 +359,15 @@ public partial class TrickplayManager : ITrickplayManager
         {
             var trickplayDirectory = _pathManager.GetTrickplayDirectory(video, saveWithMedia);
 
-            // When extraction is disabled and files live next to media, treat them as user-managed:
-            // discovery above already catalogued whatever is on disk, leave it alone.
-            if (!libraryOptions.EnableTrickplayImageExtraction && !replace && saveWithMedia)
-            {
-                return;
-            }
-
-            if (!libraryOptions.EnableTrickplayImageExtraction || replace)
+            if (replace)
             {
                 // Prune existing data
-                if (Directory.Exists(trickplayDirectory))
-                {
-                    try
-                    {
-                        Directory.Delete(trickplayDirectory, true);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning("Unable to clear trickplay directory: {Directory}: {Exception}", trickplayDirectory, ex);
-                    }
-                }
+                TryDeleteTrickplayDirectory(trickplayDirectory);
 
                 await dbContext.TrickplayInfos
                         .Where(i => i.ItemId.Equals(video.Id))
                         .ExecuteDeleteAsync(cancellationToken)
                         .ConfigureAwait(false);
-
-                if (!replace)
-                {
-                    return;
-                }
             }
 
             _logger.LogDebug("Trickplay refresh for {ItemId} (replace existing: {Replace})", video.Id, replace);
@@ -722,7 +759,20 @@ public partial class TrickplayManager : ITrickplayManager
     public async Task DeleteTrickplayDataAsync(Guid itemId, CancellationToken cancellationToken)
     {
         var dbContext = await _dbProvider.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
-        await dbContext.TrickplayInfos.Where(i => i.ItemId.Equals(itemId)).ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
+        await using (dbContext.ConfigureAwait(false))
+        {
+            var trickplayInfos = dbContext.TrickplayInfos.Where(i => i.ItemId.Equals(itemId));
+
+            // Most items have no trickplay rows. ExecuteDelete always uses the write path, even when
+            // it matches no rows. The write path costs a statement, a transaction and a write lock.
+            // A keyed read is cheap. Do the read first. Then delete only when there is data.
+            if (!await trickplayInfos.AnyAsync(cancellationToken).ConfigureAwait(false))
+            {
+                return;
+            }
+
+            await trickplayInfos.ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
+        }
     }
 
     /// <inheritdoc />
