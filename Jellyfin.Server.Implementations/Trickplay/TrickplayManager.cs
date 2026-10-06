@@ -278,105 +278,115 @@ public partial class TrickplayManager : ITrickplayManager
         }
     }
 
-    /// <inheritdoc />
-    public async Task RefreshTrickplayDataAsync(Video video, bool replace, LibraryOptions libraryOptions, CancellationToken cancellationToken)
+    /// <summary>
+    /// Deletes a trickplay directory. Writes a log warning if the delete operation fails.
+    /// </summary>
+    /// <param name="trickplayDirectory">The directory to delete.</param>
+    private void TryDeleteTrickplayDirectory(string trickplayDirectory)
     {
-        var options = _config.Configuration.TrickplayOptions;
-        if (!CanGenerateTrickplay(video, options.Interval) || libraryOptions is null)
+        if (!Directory.Exists(trickplayDirectory))
         {
             return;
         }
 
-        var saveWithMedia = libraryOptions.SaveTrickplayWithMedia;
-
-        // Catalog any existing trickplay folders on disk before any prune/generate. This picks up
-        // user-placed files even when their (width, tile dims) don't match the server's configured values.
-        if (!replace)
+        try
         {
-            await DiscoverExistingTrickplayAsync(video, saveWithMedia, cancellationToken).ConfigureAwait(false);
+            Directory.Delete(trickplayDirectory, true);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Unable to clear trickplay directory: {Directory}: {Exception}", trickplayDirectory, ex);
+        }
+    }
+
+    /// <summary>
+    /// Removes the trickplay directory and database rows of a video.
+    /// </summary>
+    /// <param name="video">The video.</param>
+    /// <param name="saveWithMedia">Whether the trickplay directory is next to the media.</param>
+    /// <param name="cancellationToken">The cancellation token.</param>
+    /// <returns>Task.</returns>
+    private async Task PruneTrickplayDataAsync(Video video, bool saveWithMedia, CancellationToken cancellationToken)
+    {
+        TryDeleteTrickplayDirectory(_pathManager.GetTrickplayDirectory(video, saveWithMedia));
+        await DeleteTrickplayDataAsync(video.Id, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc />
+    public async Task RefreshTrickplayDataAsync(Video video, bool replace, LibraryOptions libraryOptions, CancellationToken cancellationToken)
+    {
+        if (libraryOptions is null)
+        {
+            return;
         }
 
-        var dbContext = await _dbProvider.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
-        await using (dbContext.ConfigureAwait(false))
-        {
-            var trickplayDirectory = _pathManager.GetTrickplayDirectory(video, saveWithMedia);
+        var options = _config.Configuration.TrickplayOptions;
+        var saveWithMedia = libraryOptions.SaveTrickplayWithMedia;
 
-            // When extraction is disabled and files live next to media, treat them as user-managed:
-            // discovery above already catalogued whatever is on disk, leave it alone.
-            if (!libraryOptions.EnableTrickplayImageExtraction && !replace && saveWithMedia)
+        // Extraction is off: only clean up after earlier runs. The scheduled task calls this for
+        // every video, so when trickplay lives in the server directory this must stay cheap and
+        // must not query media streams.
+        var cleanupOnly = !libraryOptions.EnableTrickplayImageExtraction && !replace;
+        if (cleanupOnly && !saveWithMedia)
+        {
+            await PruneTrickplayDataAsync(video, false, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        if (!CanGenerateTrickplay(video, options.Interval))
+        {
+            return;
+        }
+
+        if (replace)
+        {
+            await PruneTrickplayDataAsync(video, saveWithMedia, cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            // Catalog existing trickplay folders on disk before generating. This picks up user-placed
+            // files even when their width and tile dimensions don't match the server's configuration.
+            await DiscoverExistingTrickplayAsync(video, saveWithMedia, cancellationToken).ConfigureAwait(false);
+
+            // Files next to the media are user-managed; leave them alone.
+            if (cleanupOnly)
             {
                 return;
             }
+        }
 
-            if (!libraryOptions.EnableTrickplayImageExtraction || replace)
+        _logger.LogDebug("Trickplay refresh for {ItemId} (replace existing: {Replace})", video.Id, replace);
+
+        if (options.Interval < 1000)
+        {
+            _logger.LogWarning("Trickplay image interval {Interval} is too small, reset to the minimum valid value of 1000", options.Interval);
+            options.Interval = 1000;
+        }
+
+        foreach (var width in options.WidthResolutions)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await RefreshTrickplayDataInternal(
+                video,
+                replace,
+                width,
+                options,
+                saveWithMedia,
+                cancellationToken).ConfigureAwait(false);
+        }
+
+        // Cleanup old trickplay files
+        var trickplayDirectory = _pathManager.GetTrickplayDirectory(video, saveWithMedia);
+        if (Directory.Exists(trickplayDirectory))
+        {
+            var existingFolders = Directory.GetDirectories(trickplayDirectory);
+            var trickplayInfos = await GetTrickplayResolutions(video.Id).ConfigureAwait(false);
+            var expectedFolders = trickplayInfos.Values.Select(i => GetTrickplayDirectory(video, i.TileWidth, i.TileHeight, i.Width, saveWithMedia));
+            var foldersToRemove = existingFolders.Except(expectedFolders);
+            foreach (var folder in foldersToRemove)
             {
-                // Prune existing data
-                if (Directory.Exists(trickplayDirectory))
-                {
-                    try
-                    {
-                        Directory.Delete(trickplayDirectory, true);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning("Unable to clear trickplay directory: {Directory}: {Exception}", trickplayDirectory, ex);
-                    }
-                }
-
-                await dbContext.TrickplayInfos
-                        .Where(i => i.ItemId.Equals(video.Id))
-                        .ExecuteDeleteAsync(cancellationToken)
-                        .ConfigureAwait(false);
-
-                if (!replace)
-                {
-                    return;
-                }
-            }
-
-            _logger.LogDebug("Trickplay refresh for {ItemId} (replace existing: {Replace})", video.Id, replace);
-
-            if (options.Interval < 1000)
-            {
-                _logger.LogWarning("Trickplay image interval {Interval} is too small, reset to the minimum valid value of 1000", options.Interval);
-                options.Interval = 1000;
-            }
-
-            foreach (var width in options.WidthResolutions)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                await RefreshTrickplayDataInternal(
-                    video,
-                    replace,
-                    width,
-                    options,
-                    saveWithMedia,
-                    cancellationToken).ConfigureAwait(false);
-            }
-
-            // Cleanup old trickplay files
-            if (Directory.Exists(trickplayDirectory))
-            {
-                var existingFolders = Directory.GetDirectories(trickplayDirectory);
-                var trickplayInfos = await dbContext.TrickplayInfos
-                        .AsNoTracking()
-                        .Where(i => i.ItemId.Equals(video.Id))
-                        .ToListAsync(cancellationToken)
-                        .ConfigureAwait(false);
-                var expectedFolders = trickplayInfos.Select(i => GetTrickplayDirectory(video, i.TileWidth, i.TileHeight, i.Width, saveWithMedia));
-                var foldersToRemove = existingFolders.Except(expectedFolders);
-                foreach (var folder in foldersToRemove)
-                {
-                    try
-                    {
-                        _logger.LogWarning("Pruning trickplay files for {Item}", video.Path);
-                        Directory.Delete(folder, true);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning("Unable to remove trickplay directory: {Directory}: {Exception}", folder, ex);
-                    }
-                }
+                _logger.LogWarning("Pruning trickplay files for {Item}", video.Path);
+                TryDeleteTrickplayDirectory(folder);
             }
         }
     }
@@ -733,7 +743,16 @@ public partial class TrickplayManager : ITrickplayManager
         var dbContext = await _dbProvider.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
         await using (dbContext.ConfigureAwait(false))
         {
-            await dbContext.TrickplayInfos.Where(i => i.ItemId.Equals(itemId)).ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
+            var trickplayInfos = dbContext.TrickplayInfos.Where(i => i.ItemId.Equals(itemId));
+
+            // Most items have no rows. ExecuteDelete takes the write path even when it matches
+            // nothing, so check with a cheap keyed read first.
+            if (!await trickplayInfos.AnyAsync(cancellationToken).ConfigureAwait(false))
+            {
+                return;
+            }
+
+            await trickplayInfos.ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
         }
     }
 

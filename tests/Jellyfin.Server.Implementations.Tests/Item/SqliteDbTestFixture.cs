@@ -21,6 +21,8 @@ namespace Jellyfin.Server.Implementations.Tests.Item;
 /// Base fixture for the item tests that run against the SQLite provider: one in-memory database per
 /// test class, plus the wiring the repositories under test need. The connection owns the database, so
 /// it stays open for the lifetime of the fixture. Derived classes seed in their own constructor.
+/// A derived class can give an EF Core interceptor to the constructor. Use an interceptor to see the
+/// SQL statements that the code under test sends to the database.
 /// </summary>
 public abstract class SqliteDbTestFixture : IDisposable
 {

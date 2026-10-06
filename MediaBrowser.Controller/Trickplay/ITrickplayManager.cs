@@ -16,6 +16,12 @@ public interface ITrickplayManager
     /// <summary>
     /// Generates new trickplay images and metadata.
     /// </summary>
+    /// <remarks>
+    /// When the library has trickplay extraction disabled and <paramref name="replace"/> is false,
+    /// this cleans up instead of generating: data in the server's trickplay directory is removed,
+    /// even for videos that trickplay cannot be generated for, and trickplay files saved next to
+    /// the media are only catalogued, never deleted.
+    /// </remarks>
     /// <param name="video">The video.</param>
     /// <param name="replace">Whether or not existing data should be replaced.</param>
     /// <param name="libraryOptions">The library options.</param>
